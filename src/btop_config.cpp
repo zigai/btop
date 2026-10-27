@@ -122,7 +122,7 @@ namespace Config {
 
 		{"update_ms", 			"#* Update time in milliseconds, recommended 2000 ms or above for better sample times for graphs."},
 
-		{"proc_sorting",		"#* Processes sorting, \"pid\" \"program\" \"arguments\" \"threads\" \"user\" \"memory\" \"cpu lazy\" \"cpu direct\",\n"
+		{"proc_sorting",		"#* Processes sorting, \"pid\" \"name\" \"command\" \"threads\" \"user\" \"memory\" \"cwd\" \"cpu lazy\" \"cpu direct\",\n"
 								"#* \"cpu lazy\" sorts top process over time (easier to follow), \"cpu direct\" updates top process directly."},
 
 		{"proc_reversed",		"#* Reverse sorting order, True or False."},
@@ -142,6 +142,19 @@ namespace Config {
 		{"proc_info_smaps",		"#* Use /proc/[pid]/smaps for memory information in the process info box (very slow but more accurate)"},
 
 		{"proc_left",			"#* Show proc box on left side of screen instead of right."},
+
+		{"proc_width_percent", "#* Process box width as a percentage of the terminal when beside memory or network.\n"
+								"#* Values: 1-99. Minimum panel widths take priority in small terminals."},
+
+		{"proc_column_pid", "#* PID column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_program", "#* Program column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_command", "#* Command column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_cwd", "#* Working-directory column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_threads", "#* Threads column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_user", "#* User column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_memory", "#* Memory column width in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_cpu", "#* CPU column width including its graph in terminal cells. 0 uses automatic sizing."},
+		{"proc_column_tree", "#* Tree column width in terminal cells. 0 uses automatic sizing."},
 
 		{"proc_filter_kernel",  "#* (Linux) Filter processes tied to the Linux kernel(similar behavior to htop)."},
 
@@ -383,6 +396,16 @@ namespace Config {
 
 	std::unordered_map<std::string_view, int> ints = {
 		{"update_ms", 2000},
+		{"proc_width_percent", 75},
+		{"proc_column_pid", 0},
+		{"proc_column_program", 0},
+		{"proc_column_command", 0},
+		{"proc_column_cwd", 0},
+		{"proc_column_threads", 0},
+		{"proc_column_user", 0},
+		{"proc_column_memory", 0},
+		{"proc_column_cpu", 0},
+		{"proc_column_tree", 0},
 		{"net_download", 100},
 		{"net_upload", 100},
 		{"proc_tree_auto_collapse", 0},
@@ -579,6 +602,12 @@ namespace Config {
 
 		else if (name == "update_ms" and i_value > ONE_DAY_MILLIS)
 			validError = fmt::format("Config value update_ms set too high (>{}).", ONE_DAY_MILLIS);
+
+		else if (name == "proc_width_percent" and (i_value < 1 or i_value > 99))
+			validError = "Config value proc_width_percent must be between 1 and 99.";
+
+		else if (i_value < 0 and rng::any_of(Proc::column_specs, [name](const auto& spec) { return spec.key == name; }))
+			validError = "Process column widths must be zero or positive.";
 
 		else if (name == "proc_tree_auto_collapse" and i_value < 0)
 			validError = "Config value proc_tree_auto_collapse must be >= 0.";

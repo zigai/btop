@@ -173,6 +173,8 @@ namespace Menu {
 
 	const vector<array<string, 2>> help_text = {
 		{"Mouse 1", "Clicks buttons and selects in process list."},
+		{"Header click", "Sort column; click again for reverse order."},
+		{"Mouse drag", "Resize process columns by dragging headings."},
 		{"Mouse scroll", "Scrolls any scrollable list/text under cursor."},
 		{"Esc, m", "Toggles main menu."},
 		{"p", "Cycle view presets forwards."},
@@ -810,6 +812,23 @@ namespace Menu {
 				"",
 				"Show proc box on left side of screen",
 				"instead of right."},
+			{"proc_width_percent",
+				"Process box width as a terminal percentage.",
+				"",
+				"Memory and network share the remaining width.",
+				"Minimum panel widths take priority.",
+				"",
+				"Min value: 1",
+				"Max value: 99"},
+			{"proc_column_pid", "PID column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_program", "Program column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_command", "Command column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_cwd", "Working-directory column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_threads", "Threads column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_user", "User column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_memory", "Memory column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_cpu", "CPU column width, including its graph.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
+			{"proc_column_tree", "Tree column width.", "", "Width in terminal cells; 0 = automatic.", "Drag a heading or gap to resize."},
 			{"graph_symbol_proc",
 				"Graph symbol to use for graphs in proc box.",
 				"",
@@ -820,8 +839,8 @@ namespace Menu {
 				"Processes sorting option.",
 				"",
 				"Possible values:",
-				"\"pid\", \"program\", \"arguments\", \"threads\",",
-				"\"user\", \"memory\", \"cpu lazy\" and",
+				"\"pid\", \"name\", \"command\", \"threads\",",
+				"\"user\", \"memory\", \"cwd\", \"cpu lazy\",",
 				"\"cpu direct\".",
 				"",
 				"\"cpu lazy\" updates top process over time.",
@@ -1404,6 +1423,7 @@ static int optionsMenu(const string& key) {
 				}
 				else if (selPred.test(isInt) and Config::intValid(option, editor.text)) {
 					Config::set(option, stoi(editor.text));
+					if (option == "proc_width_percent" or option.starts_with("proc_column_")) screen_redraw = true;
 				}
 				else
 					warnings = Config::validError;
@@ -1487,8 +1507,10 @@ static int optionsMenu(const string& key) {
 				if (key == "right" or (vim_keys and key == "l")) value += mod;
 				else value -= mod;
 
-				if (Config::intValid(option, to_string(value)))
+				if (Config::intValid(option, to_string(value))) {
 					Config::set(option, static_cast<int>(value));
+					if (option == "proc_width_percent" or option.starts_with("proc_column_")) screen_redraw = true;
+				}
 				else {
 					warnings = Config::validError;
 				}

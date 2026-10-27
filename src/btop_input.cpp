@@ -16,7 +16,11 @@ indent = tab
 tab-size = 4
 */
 
+#include <algorithm>
+#include <charconv>
+#include <cstdlib>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <vector>
 #include <thread>
@@ -88,12 +92,170 @@ namespace Input {
 	std::unordered_map<string, Mouse_loc> mouse_mappings;
 	bool dragging_scroll;
 
+	namespace {
+		struct ColumnDrag {
+			Proc::Column left, right;
+			int start_x, left_width, right_width, table_x, table_y, table_width;
+			uint64_t generation;
+			std::optional<Proc::Column> clicked;
+			bool moved = false;
+			bool changed = false;
+		};
+
+		std::optional<ColumnDrag> column_drag;
+		deque<string> pending_inputs;
+		string mouse_fragment;
+
+		auto table_snapshot() -> Proc::TableLayout {
+			const std::scoped_lock lock{Proc::columns_mutex};
+			return Proc::table_layout;
+		}
+
+		void queue_input(string bytes) {
+			if (not mouse_fragment.empty()) {
+				mouse_fragment += bytes;
+				bytes = std::move(mouse_fragment);
+				mouse_fragment.clear();
+			}
+			bool after_mouse_frame = false;
+			while (not bytes.empty()) {
+				if (bytes.starts_with("\033[<")) {
+					const auto end = bytes.find_first_of("Mm", 3);
+					const auto invalid = bytes.find_first_not_of("0123456789;Mm", 3);
+					if (invalid != string::npos and (end == string::npos or invalid < end)) {
+						pending_inputs.push_back(bytes.substr(0, invalid));
+						bytes.erase(0, invalid);
+						after_mouse_frame = false;
+						continue;
+					}
+					if (end != string::npos) {
+						pending_inputs.push_back(bytes.substr(0, end + 1));
+						bytes.erase(0, end + 1);
+						after_mouse_frame = true;
+						continue;
+					}
+					std::string_view fields{bytes.data() + 3, bytes.size() - 3};
+					bool valid = true;
+					int separators = 0;
+					while (valid) {
+						const auto separator = fields.find(';');
+						const auto field = fields.substr(0, separator);
+						if (field.empty()) valid = separator == std::string_view::npos;
+						else {
+							int value;
+							const auto parsed = std::from_chars(field.data(), field.data() + field.size(), value);
+							valid = parsed.ec == std::errc{} and parsed.ptr == field.data() + field.size();
+						}
+						if (separator == std::string_view::npos) break;
+						if (++separators > 2) valid = false;
+						fields.remove_prefix(separator + 1);
+					}
+					if (valid) mouse_fragment = std::move(bytes);
+					else pending_inputs.push_back(std::move(bytes));
+					return;
+				}
+				const auto next_mouse = bytes.find("\033[<");
+				if (next_mouse != string::npos) {
+					pending_inputs.push_back(bytes.substr(0, next_mouse));
+					bytes.erase(0, next_mouse);
+					after_mouse_frame = false;
+					continue;
+				}
+				if (bytes == "\033[" or (bytes == "\033" and after_mouse_frame)) mouse_fragment = std::move(bytes);
+				else pending_inputs.push_back(std::move(bytes));
+				return;
+			}
+		}
+
+		bool handle_header_mouse(const std::string_view key) {
+			if (not column_drag or not key.starts_with("mouse_")) return false;
+			if (key != "mouse_drag" and key != "mouse_release") {
+				column_drag->moved = true;
+				return true;
+			}
+			const auto drag = *column_drag;
+			const bool release = key == "mouse_release";
+			const bool moved = drag.moved or mouse_pos[0] != drag.start_x or mouse_pos[1] != drag.table_y;
+			if (release) column_drag.reset();
+			else column_drag->moved = moved;
+			atomic_wait(Runner::active);
+			Config::unlock();
+			const auto table = table_snapshot();
+			if (not Proc::shown or table.generation != drag.generation or table.x != drag.table_x or table.header_y != drag.table_y or table.width != drag.table_width) {
+				column_drag.reset();
+				return true;
+			}
+			const auto left = rng::find(table.columns, drag.left, &Proc::ColumnLayout::id);
+			if (left == table.columns.end() or left + 1 == table.columns.end() or (left + 1)->id != drag.right) {
+				column_drag.reset();
+				return true;
+			}
+			if (release and not moved) {
+				if (drag.clicked) {
+					const auto sorting = Proc::column_specs.at(static_cast<size_t>(*drag.clicked)).sorting;
+					if (Config::getS("proc_sorting") == sorting) Config::flip("proc_reversed");
+					else {
+						Config::set("proc_sorting", string{sorting});
+						Config::set("proc_reversed", false);
+					}
+					Config::set("update_following", true);
+					Runner::run("proc", false, true);
+				}
+				return true;
+			}
+			const int total = drag.left_width + drag.right_width;
+			const int left_width = static_cast<int>(std::clamp(static_cast<long long>(drag.left_width) + mouse_pos[0] - drag.start_x, 1LL, static_cast<long long>(total - 1)));
+			const int right_width = total - left_width;
+			if (not drag.changed and left_width == drag.left_width and right_width == drag.right_width) return true;
+			const auto left_key = Proc::column_specs.at(static_cast<size_t>(drag.left)).key;
+			const auto right_key = Proc::column_specs.at(static_cast<size_t>(drag.right)).key;
+			if (Config::getI(left_key) != left_width or Config::getI(right_key) != right_width) {
+				Config::set(left_key, left_width);
+				Config::set(right_key, right_width);
+				if (column_drag) column_drag->changed = true;
+				Runner::run("proc", true, true);
+			}
+			return true;
+		}
+	}
+
+	auto parse_mouse(std::string_view sgr_body) -> std::optional<MouseEvent> {
+		if (not sgr_body.starts_with("[<") or sgr_body.size() < 3) return {};
+		const char terminator = sgr_body.back();
+		if (terminator != 'M' and terminator != 'm') return {};
+		sgr_body.remove_prefix(2);
+		sgr_body.remove_suffix(1);
+		array<int, 3> fields{};
+		for (size_t index = 0; index < fields.size(); ++index) {
+			const auto separator = index + 1 == fields.size() ? sgr_body.size() : sgr_body.find(';');
+			if (separator == std::string_view::npos or separator == 0) return {};
+			const auto field = sgr_body.substr(0, separator);
+			const auto parsed = std::from_chars(field.data(), field.data() + field.size(), fields[index]);
+			if (parsed.ec != std::errc{} or parsed.ptr != field.data() + field.size()) return {};
+			sgr_body.remove_prefix(separator + (index + 1 < fields.size() ? 1 : 0));
+		}
+		if (fields[1] <= 0 or fields[2] <= 0) return {};
+		string key;
+		if (fields[0] == 0) key = terminator == 'm' ? "mouse_release" : "mouse_click";
+		else if (terminator == 'm') return {};
+		else if (fields[0] == 32) key = "mouse_drag";
+		else if (fields[0] == 64) key = "mouse_scroll_up";
+		else if (fields[0] == 65) key = "mouse_scroll_down";
+		else return {};
+		return MouseEvent{std::move(key), {fields[1], fields[2]}};
+	}
+
 	deque<string> history(50, "");
 	string old_filter;
 	string input;
 
 	bool poll(const uint64_t timeout) {
 		atomic_lock lck(polling);
+		if (not pending_inputs.empty()) {
+			input = std::move(pending_inputs.front());
+			pending_inputs.pop_front();
+			return true;
+		}
 		fd_set fds;
 		FD_ZERO(&fds);
 		FD_SET(STDIN_FILENO, &fds);
@@ -107,13 +269,16 @@ namespace Input {
 		}
 
 		if(pselect(STDIN_FILENO + 1, &fds, nullptr, nullptr, waitptr, &signal_mask) > 0) {
-			input.clear();
+			string bytes;
 			char buf[1024];
 			ssize_t count = 0;
 			while((count = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
-				input.append(std::string_view(buf, count));
+				bytes.append(std::string_view(buf, count));
 			}
-
+			queue_input(std::move(bytes));
+			if (pending_inputs.empty()) return false;
+			input = std::move(pending_inputs.front());
+			pending_inputs.pop_front();
 			return true;
 		}
 
@@ -130,66 +295,39 @@ namespace Input {
 			
 			//? Detect if input is a mouse event.
 			if (key.starts_with("[<")) {
-				std::string_view key_view = key;
-				string mouse_event;
-				if (key_view.starts_with("[<0;") and key_view.find('M') != std::string_view::npos) {
-					mouse_event = "mouse_click";
-					key_view.remove_prefix(4);
+				const auto event = parse_mouse(key);
+				if (not event) {
+					column_drag.reset();
+					dragging_scroll = false;
+					return "";
 				}
-				else if (key_view.starts_with("[<32;")) {
-					mouse_event = "mouse_drag";
-					key_view.remove_prefix(5);
+				key = event->key;
+				mouse_pos = event->position;
+				if (key == "mouse_click" or Menu::active) {
+					column_drag.reset();
+					dragging_scroll = false;
 				}
-				else if (key_view.starts_with("[<0;") and key_view.ends_with('m')) {
-					mouse_event = "mouse_release";
-					key_view.remove_prefix(4);
-				}
-				else if (key_view.starts_with("[<64;")) {
-					mouse_event = "mouse_scroll_up";
-					key_view.remove_prefix(5);
-				}
-				else if (key_view.starts_with("[<65;")) {
-					mouse_event = "mouse_scroll_down";
-					key_view.remove_prefix(5);
-				}
-				else
-					key.clear();
-
-				if (Config::getB("proc_filtering")) {
-					if (mouse_event == "mouse_click") return mouse_event;
-					else return "";
-				}
-
-				//? Get column and line position of mouse and check for any actions mapped to current position
-				if (not key.empty()) {
-					try {
-						const auto delim = key_view.find(';');
-						mouse_pos[0] = stoi((string)key_view.substr(0, delim));
-						mouse_pos[1] = stoi((string)key_view.substr(delim + 1, key_view.find('M', delim)));
-					}
-					catch (const std::invalid_argument&) { mouse_event.clear(); }
-					catch (const std::out_of_range&) { mouse_event.clear(); }
-
-					key = mouse_event;
-
-					if (key == "mouse_click" or key == "mouse_drag") {
-						const auto& [col, line] = mouse_pos;
-
-						for (const auto& [mapped_key, pos] : (Menu::active ? Menu::mouse_mappings : mouse_mappings)) {
-							if (col >= pos.col and col < pos.col + pos.width and line >= pos.line and line < pos.line + pos.height) {
-								key = mapped_key;
-								break;
-							}
+				if (Config::getB("proc_filtering")) return key == "mouse_click" ? key : "";
+				if (not column_drag and not dragging_scroll and key == "mouse_click") {
+					atomic_wait(Runner::active);
+					const auto& [col, line] = mouse_pos;
+					for (const auto& [mapped_key, pos] : (Menu::active ? Menu::mouse_mappings : mouse_mappings)) {
+						if (col >= pos.col and col < pos.col + pos.width and line >= pos.line and line < pos.line + pos.height) {
+							key = mapped_key;
+							break;
 						}
 					}
 				}
-
 			}
 			else if (auto it = Key_escapes.find(key); it != Key_escapes.end())
 				key = it->second;
 			else if (ulen(key) > 1)
 				key.clear();
 
+			if (not key.starts_with("mouse_")) {
+				column_drag.reset();
+				dragging_scroll = false;
+			}
 			if (not key.empty()) {
 				history.push_back(key);
 				history.pop_front();
@@ -214,6 +352,11 @@ namespace Input {
 	void process(const std::string_view key) {
 		if (key.empty()) return;
 		try {
+			if (not key.starts_with("mouse_")) {
+				column_drag.reset();
+				dragging_scroll = false;
+			}
+			if (handle_header_mouse(key)) return;
 			auto filtering = Config::getB("proc_filtering");
 			auto vim_keys = Config::getB("vim_keys");
 			auto help_key = (vim_keys ? "H" : "h");
@@ -397,6 +540,29 @@ namespace Input {
 					const int height = (Config::getB("show_detailed") ? Proc::height - 8 : Proc::height);
 					const auto in_proc_box = col >= Proc::x + 1 and col < Proc::x + Proc::width and line >= y + 1 and line < y + height - 1;
 					if (key == "mouse_click") {
+						atomic_wait(Runner::active);
+						const auto table = table_snapshot();
+						if (line == table.header_y and col >= table.x + 1 and col < table.x + table.width - 2) {
+							std::optional<Proc::Column> clicked;
+							for (const auto& column : table.columns) {
+								if (col >= table.x + column.x and col < table.x + column.x + column.width) {
+									clicked = column.id;
+									break;
+								}
+							}
+							int nearest_distance = table.width;
+							for (size_t index = 0; index + 1 < table.columns.size(); ++index) {
+								const auto& left = table.columns[index];
+								const auto& right = table.columns[index + 1];
+								const int distance = std::abs(col - (table.x + left.x + left.width));
+								if (distance < nearest_distance) {
+									nearest_distance = distance;
+									column_drag = ColumnDrag{left.id, right.id, col, left.width, right.width, table.x, table.header_y, table.width, table.generation, clicked};
+								}
+							}
+							dragging_scroll = false;
+							return;
+						}
 						if (in_proc_box) {
 							if (col < Proc::x + Proc::width - 2) {
 								const auto& current_selection = Config::getI("proc_selected");
@@ -405,7 +571,8 @@ namespace Input {
 									if (Config::getB("proc_tree")) {
 										const int x_pos = col - Proc::x;
 										const int offset = Config::getI("selected_depth") * 3;
-										if (x_pos > offset and x_pos < 4 + offset) {
+										if (x_pos > offset and x_pos < 4 + offset and not table.columns.empty() and
+											col < table.x + table.columns.front().x + table.columns.front().width) {
 											process("space");
 											return;
 										}

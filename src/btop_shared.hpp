@@ -23,6 +23,7 @@ tab-size = 4
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -378,11 +379,52 @@ namespace Proc {
 	//? Translation from process state char to explanative string
 	extern const std::unordered_map<char, string> proc_states;
 
+	enum class Column { pid, program, command, cwd, threads, user, memory, cpu, tree };
+
+	struct ColumnSpec {
+		std::string_view key;
+		std::string_view title;
+		std::string_view sorting;
+	};
+
+	inline constexpr array<ColumnSpec, 9> column_specs = {{
+		{"proc_column_pid", "Pid:", "pid"},
+		{"proc_column_program", "Program:", "name"},
+		{"proc_column_command", "Command:", "command"},
+		{"proc_column_cwd", "Cwd:", "cwd"},
+		{"proc_column_threads", "Thr:", "threads"},
+		{"proc_column_user", "User:", "user"},
+		{"proc_column_memory", "MemB", "memory"},
+		{"proc_column_cpu", "Cpu%", "cpu direct"},
+		{"proc_column_tree", "Tree:", "name"}
+	}};
+
+	struct ColumnLayout {
+		Column id;
+		int x;
+		int width;
+	};
+
+	struct TableLayout {
+		vector<ColumnLayout> columns;
+		int x{};
+		int header_y{};
+		int width{};
+		uint64_t generation{};
+	};
+
+	extern TableLayout table_layout;
+	extern std::mutex columns_mutex;
+
+	auto column_layout(int width, bool tree, bool show_graphs) -> vector<ColumnLayout>;
+	auto abbreviate_home(const string& path) -> string;
+
 	//* Container for process information
 	struct proc_info {
 		size_t pid{};
 		string name{};          // defaults to ""
 		string cmd{};           // defaults to ""
+		string cwd{};
 		string short_cmd{};     // defaults to ""
 		size_t threads{};
 		int name_offset{};

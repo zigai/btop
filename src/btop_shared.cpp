@@ -17,6 +17,8 @@ tab-size = 4
 */
 
 #include <sys/resource.h>
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <ranges>
@@ -94,6 +96,70 @@ namespace Gpu {
 #endif
 
 namespace Proc {
+	auto abbreviate_home(const string& path) -> string {
+		const auto home = std::getenv("HOME");
+		if (home == nullptr or *home == '\0') return path;
+		std::string_view prefix{home};
+		while (prefix.size() > 1 and prefix.back() == '/') prefix.remove_suffix(1);
+		if (path == prefix) return "~";
+		if (prefix == "/" and path.starts_with('/')) return "~" + path;
+		if (path.starts_with(prefix) and path.size() > prefix.size() and path[prefix.size()] == '/')
+			return "~" + path.substr(prefix.size());
+		return path;
+	}
+
+	auto column_layout(int width, bool tree, bool show_graphs) -> vector<ColumnLayout> {
+		const array<int, 9> defaults = {8, width > 70 ? 16 : 8, 1, 1, width >= 75 ? 4 : 0, width >= 75 ? 10 : 5, 5, show_graphs ? 10 : 4, 1};
+		const vector<Column> order = tree
+			? vector<Column>{Column::tree, Column::cwd, Column::threads, Column::user, Column::memory, Column::cpu}
+			: vector<Column>{Column::pid, Column::program, Column::command, Column::cwd, Column::threads, Column::user, Column::memory, Column::cpu};
+		vector<ColumnLayout> layout;
+		for (const auto id : order) {
+			const auto index = static_cast<size_t>(id);
+			const int requested = Config::getI(column_specs.at(index).key);
+			if (requested == 0 and ((width <= 55 and (id == Column::command or id == Column::cwd)) or defaults.at(index) == 0)) continue;
+			layout.push_back({id, 0, std::clamp(requested == 0 ? defaults.at(index) : requested, 1, width - 3)});
+		}
+
+		const int content_width = width - 3 - static_cast<int>(layout.size() - 1);
+		long long total = 0;
+		for (const auto& column : layout) total += column.width;
+		long long deficit = std::max(0LL, total - content_width);
+		for (const bool automatic : {true, false}) {
+			for (auto& column : layout) {
+				if ((Config::getI(column_specs.at(static_cast<size_t>(column.id)).key) == 0) != automatic) continue;
+				const int reduction = static_cast<int>(std::min(deficit, static_cast<long long>(column.width - 1)));
+				column.width -= reduction;
+				deficit -= reduction;
+				total -= reduction;
+			}
+		}
+
+		vector<size_t> flexible;
+		for (size_t index = 0; index < layout.size(); ++index) {
+			const auto& column = layout[index];
+			if (Config::getI(column_specs.at(static_cast<size_t>(column.id)).key) == 0 and
+				(column.id == Column::command or column.id == Column::cwd or column.id == Column::tree)) flexible.push_back(index);
+		}
+		if (flexible.empty()) {
+			const auto program = rng::find(layout, Column::program, &ColumnLayout::id);
+			if (program != layout.end() and Config::getI(column_specs.at(static_cast<size_t>(Column::program)).key) == 0)
+				flexible.push_back(static_cast<size_t>(program - layout.begin()));
+		}
+		int remaining = content_width - static_cast<int>(total);
+		for (size_t index = 0; index < flexible.size(); ++index) {
+			const int extra = remaining / static_cast<int>(flexible.size() - index);
+			layout[flexible[index]].width += extra;
+			remaining -= extra;
+		}
+
+		int position = 1;
+		for (auto& column : layout) {
+			column.x = position;
+			position += column.width + 1;
+		}
+		return layout;
+	}
 bool set_priority(pid_t pid, int priority) {
   if (setpriority(PRIO_PROCESS, pid, priority) == 0) {
     return true;
@@ -112,6 +178,7 @@ bool set_priority(pid_t pid, int priority) {
 			case 5: rng::stable_sort(proc_vec, rng::less{}, &proc_info::mem); 		break;
 			case 6: rng::stable_sort(proc_vec, rng::less{}, &proc_info::cpu_p);		break;
 			case 7: rng::stable_sort(proc_vec, rng::less{}, &proc_info::cpu_c);		break;
+			case 8: rng::stable_sort(proc_vec, rng::greater{}, &proc_info::cwd);		break;
 			}
 		}
 		else {
@@ -124,6 +191,7 @@ bool set_priority(pid_t pid, int priority) {
 			case 5: rng::stable_sort(proc_vec, rng::greater{}, &proc_info::mem); 		break;
 			case 6: rng::stable_sort(proc_vec, rng::greater{}, &proc_info::cpu_p);   	break;
 			case 7: rng::stable_sort(proc_vec, rng::greater{}, &proc_info::cpu_c);   	break;
+			case 8: rng::stable_sort(proc_vec, rng::less{}, &proc_info::cwd);		break;
 			}
 		}
 
@@ -153,6 +221,7 @@ bool set_priority(pid_t pid, int priority) {
 				case 5: rng::stable_sort(proc_vec, [](const auto& a, const auto& b) { return a.entry.get().mem < b.entry.get().mem; });	break;
 				case 6: rng::stable_sort(proc_vec, [](const auto& a, const auto& b) { return a.entry.get().cpu_p < b.entry.get().cpu_p; });	break;
 				case 7: rng::stable_sort(proc_vec, [](const auto& a, const auto& b) { return a.entry.get().cpu_c < b.entry.get().cpu_c; });	break;
+				case 8: rng::stable_sort(proc_vec, [](const auto& first, const auto& second) { return first.entry.get().cwd > second.entry.get().cwd; }); break;
 				}
 			}
 			else {
@@ -161,6 +230,7 @@ bool set_priority(pid_t pid, int priority) {
 				case 5: rng::stable_sort(proc_vec, [](const auto& a, const auto& b) { return a.entry.get().mem > b.entry.get().mem; });	break;
 				case 6: rng::stable_sort(proc_vec, [](const auto& a, const auto& b) { return a.entry.get().cpu_p > b.entry.get().cpu_p; });	break;
 				case 7: rng::stable_sort(proc_vec, [](const auto& a, const auto& b) { return a.entry.get().cpu_c > b.entry.get().cpu_c; });	break;
+				case 8: rng::stable_sort(proc_vec, [](const auto& first, const auto& second) { return first.entry.get().cwd < second.entry.get().cwd; }); break;
 				}
 			}
 		}
@@ -183,14 +253,14 @@ bool set_priority(pid_t pid, int priority) {
 			try {
 				std::regex regex { filter.substr(1), std::regex::extended };
 				return std::regex_search(std::to_string(proc.pid), regex) || std::regex_search(proc.name, regex) ||
-							 std::regex_match(proc.cmd, regex) || std::regex_search(proc.user, regex);
+							 std::regex_match(proc.cmd, regex) || std::regex_search(proc.user, regex) || std::regex_search(proc.cwd, regex) || std::regex_search(abbreviate_home(proc.cwd), regex);
 			} catch (std::regex_error& /* unused */) {
 				return false;
 			}
 		}
 
 		return std::to_string(proc.pid).contains(filter) || s_contains_ic(proc.name, filter) ||
-					 s_contains_ic(proc.cmd, filter) || s_contains_ic(proc.user, filter);
+					 s_contains_ic(proc.cmd, filter) || s_contains_ic(proc.user, filter) || s_contains_ic(proc.cwd, filter) || s_contains_ic(abbreviate_home(proc.cwd), filter);
 	}
 
 	void _tree_gen(proc_info& cur_proc, vector<proc_info>& in_procs, vector<tree_proc>& out_procs,
@@ -343,6 +413,7 @@ const vector<string> Proc::sort_vector = {
 	"memory",
 	"cpu direct",
 	"cpu lazy",
+	"cwd",
 };
 
 const std::unordered_map<char, string> Proc::proc_states = {

@@ -3323,6 +3323,9 @@ namespace Proc {
 				else if (dead_procs.contains(pid)) continue;
 
 				auto& new_proc = *find_old;
+				std::error_code cwd_error;
+				const auto cwd = fs::read_symlink(d.path() / "cwd", cwd_error);
+				new_proc.cwd = cwd_error ? string{} : cwd.string();
 
 				//? Get program name, command and username
 				if (no_cache) {

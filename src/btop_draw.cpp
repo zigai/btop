@@ -20,6 +20,7 @@ tab-size = 4
 #include <array>
 #include <cmath>
 #include <iterator>
+#include <mutex>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -1220,7 +1221,7 @@ namespace Gpu {
 #endif
 
 namespace Mem {
-	int width_p = 45, height_p = 40;
+	int height_p = 40;
 	int min_width = 36, min_height = 10;
 	int x = 1, y, width = 20, height;
 	int mem_width, disks_width, divider, item_height, mem_size, mem_meter, graph_height, disk_meter;
@@ -1486,7 +1487,7 @@ namespace Mem {
 }
 
 namespace Net {
-	int width_p = 45, height_p = 28;
+	int height_p = 28;
 	int min_width = 36, min_height = 6;
 	int x = 1, y, width = 20, height;
 	int b_x, b_y, b_width, b_height, d_graph_height, u_graph_height;
@@ -1601,7 +1602,7 @@ namespace Net {
 }
 
 namespace Proc {
-	int width_p = 55, height_p = 68;
+	int height_p = 68;
 	int min_width = 44, min_height = 16;
 	int x, y, width = 20, height;
 	int start, selected, select_max;
@@ -1611,18 +1612,36 @@ namespace Proc {
 	int scroll_pos;
 	string selected_name;
 	std::unordered_map<size_t, Draw::Graph> p_graphs;
-	std::unordered_map<size_t, bool> p_wide_cmd;
 	std::unordered_map<size_t, int> p_counters;
 	int counter = 0;
 	Draw::TextEdit filter;
 	Draw::Graph detailed_cpu_graph;
 	Draw::Graph detailed_mem_graph;
-	int user_size, thread_size, prog_size, cmd_size, tree_size;
+	vector<ColumnLayout> columns;
+	int header_y;
+	TableLayout table_layout;
+	std::mutex columns_mutex;
 	int dgraph_x, dgraph_width, d_width, d_x, d_y;
 	bool previous_proc_banner_state = false;
 	atomic<bool> resized (false);
 
 	string box;
+
+	namespace {
+		string cell_text(const string& value, int width, bool right = false, bool tail = false) {
+			auto text = replace_ascii_control(value);
+			if (cmp_greater(ulen(text, true), width)) {
+				const string marker = "…";
+				const int available = width - static_cast<int>(ulen(marker, true));
+				text = tail ? luresize(text, available) : uresize(text, available);
+				while (cmp_greater(ulen(text, true), available))
+					text = tail ? luresize(text, ulen(text) - 1) : uresize(text, ulen(text) - 1);
+				text = tail ? marker + text : text + marker;
+			}
+			const string padding(width - ulen(text, true), ' ');
+			return right ? padding + text : text + padding;
+		}
+	}
 
 	int selection(const std::string_view cmd_key) {
 		auto start = Config::getI("proc_start");
@@ -1803,15 +1822,11 @@ namespace Proc {
 			for (const auto& key : {"t", "K", "k", "s", "N", "F", "enter", "info_enter"})
 				if (Input::mouse_mappings.contains(key)) Input::mouse_mappings.erase(key);
 
-			//? Adapt sizes of text fields
-			user_size = (width < 75 ? 5 : 10);
-			thread_size = (width < 75 ? - 1 : 4);
-			prog_size = (width > 70 ? 16 : ( width > 55 ? 8 : width - user_size - thread_size - 33));
-			cmd_size = (width > 55 ? width - prog_size - user_size - thread_size - 33 : -1);
-			tree_size = width - user_size - thread_size - 23;
-			if (not show_graphs) {
-				cmd_size += 5;
-				tree_size += 5;
+			columns = column_layout(width, proc_tree, show_graphs);
+			header_y = y + 1;
+			{
+				const std::scoped_lock lock{columns_mutex};
+				table_layout = {columns, x, header_y, width, table_layout.generation};
 			}
 
 			//? Detailed box
@@ -1882,16 +1897,15 @@ namespace Proc {
 				if (item_fit >= 8) out += cjust("Nice:", item_width);
 
 
-				//? Command line
-				for (int i = 0; const auto& l : {'C', 'M', 'D'})
-				out += Mv::to(d_y + 5 + i++, d_x + 1) + l;
+				//? Command and working directory
+				out += Mv::to(d_y + 5, d_x + 1) + "CMD" + Mv::to(d_y + 7, d_x + 1) + "CWD";
 
 				out += Theme::c("main_fg") + Fx::ub;
 				const auto san_cmd = replace_ascii_control(detailed.entry.cmd);
 				const int cmd_size = ulen(san_cmd, true);
-				for (int num_lines = min(3, (int)ceil((double)cmd_size / (d_width - 5))), i = 0; i < num_lines; i++) {
-					out += Mv::to(d_y + 5 + (num_lines == 1 ? 1 : i), d_x + 3)
-						+ cjust(luresize(san_cmd, cmd_size - (d_width - 5) * i, true), d_width - 5, true, true);
+				for (int num_lines = min(2, (int)ceil((double)cmd_size / (d_width - 7))), i = 0; i < num_lines; i++) {
+					out += Mv::to(d_y + 5 + i, d_x + 5)
+						+ cjust(luresize(san_cmd, cmd_size - (d_width - 7) * i, true), d_width - 7, true, true);
 				}
 
 			}
@@ -1980,19 +1994,13 @@ namespace Proc {
 			}
 
 			//? Labels for fields in list
-			if (not proc_tree)
-				out += Mv::to(y+1, x+1) + Theme::c("title") + Fx::b
-					+ rjust("Pid:", 8) + ' '
-					+ ljust("Program:", prog_size) + ' '
-					+ (cmd_size > 0 ? ljust("Command:", cmd_size) : "") + ' ';
-			else
-				out += Mv::to(y+1, x+1) + Theme::c("title") + Fx::b
-					+ ljust("Tree:", tree_size) + ' ';
-
-			out += (thread_size > 0 ? Mv::l(4) + "Threads: " : "")
-					+ ljust("User:", user_size) + ' '
-					+ rjust((mem_bytes ? "MemB" : "Mem%"), 5) + ' '
-					+ rjust("Cpu%", (show_graphs ? 10 : 5)) + Fx::ub;
+			out += Mv::to(header_y, x + 1) + Theme::c("title") + Fx::b + string(width - 3, ' ');
+			for (const auto& column : columns) {
+				const auto& spec = column_specs.at(static_cast<size_t>(column.id));
+				const string title = column.id == Column::memory ? (mem_bytes ? "MemB" : "Mem%") : string{spec.title};
+				out += Mv::to(header_y, x + column.x) + cell_text(title, column.width);
+			}
+			out += Fx::ub;
 		}
 		//* End of redraw block
 
@@ -2031,6 +2039,8 @@ namespace Proc {
 				+ Theme::c("inactive_fg") + Fx::ub + graph_bg * (d_width / 3) + Mv::l(d_width / 3)
 				+ Theme::c("proc_misc") + detailed_mem_graph(detailed.mem_bytes, (redraw or data_same or not alive)) + ' '
 				+ Theme::c("title") + Fx::b + detailed.memory;
+			out += Mv::to(d_y + 7, d_x + 5) + Theme::c("main_fg") + Fx::ub
+				+ cell_text(detailed.entry.cwd.empty() ? "-" : abbreviate_home(detailed.entry.cwd), d_width - 7, false, true);
 		}
 
 		//? Check bounds of current selection and view
@@ -2107,35 +2117,7 @@ namespace Proc {
 
 			const auto san_cmd = replace_ascii_control(p.cmd);
 
-			if (not p_wide_cmd.contains(p.pid)) p_wide_cmd[p.pid] = ulen(san_cmd) != ulen(san_cmd, true);
-
-			//? Normal view line
-			if (not proc_tree) {
-				out += Mv::to(y+2+lc, x+1)
-					+ g_color + rjust(to_string(p.pid), 8) + ' '
-					+ c_color + ljust(p.name, prog_size, true) + ' ' + end
-					+ (cmd_size > 0 ? g_color + ljust(san_cmd, cmd_size, true, p_wide_cmd[p.pid]) + Mv::to(y+2+lc, x+11+prog_size+cmd_size) + ' ' : "");
-			}
-			//? Tree view line
-			else {
-				const string prefix_pid = p.prefix + to_string(p.pid);
-				int width_left = tree_size;
-				out += Mv::to(y+2+lc, x+1) + g_color + uresize(prefix_pid, width_left) + ' ';
-				width_left -= ulen(prefix_pid);
-				if (width_left > 0) {
-					out += c_color + uresize(p.name, width_left - 1) + end + ' ';
-					width_left -= (ulen(p.name) + 1);
-				}
-				if (width_left > 7) {
-					const string_view cmd = width_left > 40 ? rtrim(san_cmd) : p.short_cmd;
-					if (not cmd.empty() and cmd != p.name) {
-						out += g_color + '(' + uresize(string{cmd}, width_left - 3, p_wide_cmd[p.pid]) + ") ";
-						width_left -= (ulen(string{cmd}, true) + 3);
-					}
-				}
-				out += string(max(0, width_left), ' ') + Mv::to(y+2+lc, x+2+tree_size);
-			}
-			//? Common end of line
+			//? Resource values
 			string cpu_str = fmt::format("{:.2f}", p.cpu_p);
 			if (p.cpu_p < 10 or (p.cpu_p >= 100 and p.cpu_p < 1000)) cpu_str.resize(3);
 			else if (p.cpu_p >= 10'000) {
@@ -2162,12 +2144,37 @@ namespace Proc {
 				}
 			}();
 
-			out += (thread_size > 0 ? t_color + rjust(proc_threads_string, thread_size) + ' ' + end : "" )
-				+ g_color + ljust((cmp_greater(p.user.size(), user_size) ? p.user.substr(0, user_size - 1) + '+' : p.user), user_size) + ' '
-				+ m_color + rjust(mem_str, 5) + end + ' '
-				+ (is_selected or is_followed ? "" : Theme::c("inactive_fg")) + (show_graphs ? graph_bg * 5: "")
-				+ (p_graphs.contains(p.pid) ? Mv::l(5) + c_color + p_graphs.at(p.pid)({(p.cpu_p >= 0.1 and p.cpu_p < 5 ? 5ll : (long long)round(p.cpu_p))}, data_same) : "") + end + ' '
-				+ c_color + rjust(cpu_str, 4) + "  " + end;
+			const int row = y + 2 + lc;
+			out += Mv::to(row, x + 1) + string(width - 3, ' ');
+			for (const auto& column : columns) {
+				string value, color = g_color;
+				bool right = false, tail = false;
+				switch (column.id) {
+					case Column::pid: value = to_string(p.pid); right = true; break;
+					case Column::program: value = p.name; color = c_color; break;
+					case Column::command: value = san_cmd; break;
+					case Column::cwd: value = p.cwd.empty() ? "-" : abbreviate_home(p.cwd); tail = true; break;
+					case Column::threads: value = proc_threads_string; color = t_color; right = true; break;
+					case Column::user: value = p.user; break;
+					case Column::memory: value = mem_str; color = m_color; right = true; break;
+					case Column::cpu: value = cpu_str; color = c_color; right = true; break;
+					case Column::tree: {
+						value = p.prefix + to_string(p.pid) + ' ' + p.name;
+						const string_view command = column.width > 40 ? rtrim(san_cmd) : string_view{p.short_cmd};
+						if (not command.empty() and command != p.name) value += " (" + string{command} + ')';
+						color = c_color;
+						break;
+					}
+				}
+				out += Mv::to(row, x + column.x);
+				if (column.id == Column::cpu and show_graphs and column.width >= 10) {
+					out += (is_selected or is_followed ? "" : Theme::c("inactive_fg")) + graph_bg * 5;
+					if (p_graphs.contains(p.pid))
+						out += Mv::l(5) + c_color + p_graphs.at(p.pid)({(p.cpu_p >= 0.1 and p.cpu_p < 5 ? 5ll : (long long)round(p.cpu_p))}, data_same);
+					out += end + ' ' + color + cell_text(value, column.width - 6, true) + end;
+				}
+				else out += color + cell_text(value, column.width, right, tail) + end;
+			}
 			if (lc++ > height - 5) break;
 			else if (lc > height - 5 and proc_banner_shown) break;
 		}
@@ -2216,9 +2223,6 @@ namespace Proc {
 				return rng::find(plist, pair.first, &proc_info::pid) == plist.end();
 			});
 
-			std::erase_if(p_wide_cmd, [&](const auto& pair) {
-				return rng::find(plist, pair.first, &proc_info::pid) == plist.end();
-			});
 		}
 
 		//? Draw hide button if detailed view is shown
@@ -2258,6 +2262,12 @@ namespace Draw {
 		Mem::box.clear();
 		Net::box.clear();
 		Proc::box.clear();
+		{
+			const std::scoped_lock lock{Proc::columns_mutex};
+			const auto generation = Proc::table_layout.generation + 1;
+			Proc::table_layout = {};
+			Proc::table_layout.generation = generation;
+		}
 		Global::clock.clear();
 		Global::overlay.clear();
 		Runner::pause_output = false;
@@ -2302,6 +2312,13 @@ namespace Draw {
 		Mem::shown = boxes.contains("mem");
 		Net::shown = boxes.contains("net");
 		Proc::shown = boxes.contains("proc");
+
+		int side_width = Term::width;
+		if (Proc::shown and (Mem::shown or Net::shown)) {
+			const int minimum_side_width = max(Mem::shown ? Mem::min_width : 0, Net::shown ? Net::min_width : 0);
+			side_width = clamp(static_cast<int>(round(static_cast<double>(Term::width) * (100 - Config::getI("proc_width_percent")) / 100)),
+				minimum_side_width, Term::width - Proc::min_width);
+		}
 
 		//* Calculate and draw cpu box outlines
 		if (Cpu::shown) {
@@ -2434,7 +2451,7 @@ namespace Draw {
 			auto swap_disk = Config::getB("swap_disk");
 			auto mem_graphs = Config::getB("mem_graphs");
 
-			width = round((double)Term::width * (Proc::shown ? width_p : 100) / 100);
+			width = side_width;
 		#ifdef GPU_SUPPORT
 			height = floor(static_cast<double>(Term::height) * (100 - Net::height_p * Net::shown*4 / ((Gpu::shown != 0 and Cpu::shown) + 4)) / 100) - Cpu::height - Gpu::total_height;
 		#else
@@ -2498,7 +2515,7 @@ namespace Draw {
 		//* Calculate and draw net box outlines
 		if (Net::shown) {
 			using namespace Net;
-			width = round((double)Term::width * (Proc::shown ? width_p : 100) / 100);
+			width = side_width;
 		#ifdef GPU_SUPPORT
 			height = Term::height - Cpu::height - Gpu::total_height - Mem::height;
 		#else

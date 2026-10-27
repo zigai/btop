@@ -21,7 +21,9 @@ tab-size = 4
 #include <array>
 #include <atomic>
 #include <deque>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <string_view>
 #include <unordered_map>
 
@@ -38,6 +40,13 @@ using std::string;
 
 //* Functions and variables for handling keyboard and mouse input
 namespace Input {
+
+	struct MouseEvent {
+		string key;
+		array<int, 2> position;
+	};
+
+	auto parse_mouse(std::string_view sgr_body) -> std::optional<MouseEvent>;
 
 	struct Mouse_loc {
 		int line, col, height, width;
